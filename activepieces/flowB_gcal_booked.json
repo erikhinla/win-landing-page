@@ -1,0 +1,196 @@
+{
+  "displayName": "Flow B: Google Calendar Booking Follow-up",
+  "trigger": {
+    "type": "PIECE",
+    "name": "gcal_event_trigger",
+    "displayName": "New Google Calendar Event",
+    "settings": {
+      "pieceName": "@activepieces/piece-google-calendar",
+      "pieceVersion": "latest",
+      "triggerName": "new_event",
+      "input": {
+        "calendarId": "{{env.GOOGLE_CALENDAR_ID}}",
+        "eventTypes": ["created"]
+      }
+    }
+  },
+  "actions": [
+    {
+      "type": "CODE",
+      "name": "extract_event_details",
+      "displayName": "Extract Event Details",
+      "settings": {
+        "sourceCode": {
+          "packageJson": "{}",
+          "code": "export const code = async (inputs) => {\n  const event = inputs.event;\n  \n  // Extract attendee email\n  const attendees = event.attendees || [];\n  const clientEmail = attendees.find(a => !a.organizer)?.email || null;\n  \n  // Extract event details\n  const eventTitle = event.summary || 'AI-Edge Strategy Call';\n  const eventStart = event.start?.dateTime || event.start?.date;\n  const eventEnd = event.end?.dateTime || event.end?.date;\n  const eventDescription = event.description || '';\n  \n  // Try to extract submission ID from description or title\n  const submissionIdMatch = (eventDescription + ' ' + eventTitle).match(/submission[_\\s]?id[:\\s]+([a-zA-Z0-9-]+)/i);\n  const submissionId = submissionIdMatch ? submissionIdMatch[1] : null;\n  \n  // Extract business name if present\n  const businessNameMatch = eventDescription.match(/business[:\\s]+(.+?)(?:\\n|$)/i);\n  const businessName = businessNameMatch ? businessNameMatch[1].trim() : 'Unknown Business';\n  \n  return {\n    eventId: event.id,\n    eventTitle,\n    eventStart,\n    eventEnd,\n    clientEmail,\n    submissionId,\n    businessName,\n    eventLink: event.htmlLink,\n    timestamp: new Date().toISOString()\n  };\n};"
+        },
+        "input": {
+          "event": "{{trigger.body}}"
+        }
+      }
+    },
+    {
+      "type": "PIECE",
+      "name": "check_duplicate_booking",
+      "displayName": "Check for Duplicate Booking",
+      "settings": {
+        "pieceName": "@activepieces/piece-store",
+        "pieceVersion": "latest",
+        "actionName": "get",
+        "input": {
+          "key": "gcal_event_{{extract_event_details.eventId}}"
+        }
+      }
+    },
+    {
+      "type": "BRANCH",
+      "name": "duplicate_booking_check",
+      "displayName": "Is Duplicate Booking?",
+      "settings": {
+        "conditions": [
+          [
+            {
+              "firstValue": "{{check_duplicate_booking}}",
+              "secondValue": null,
+              "operator": "NOT_EQUAL"
+            }
+          ]
+        ]
+      },
+      "onSuccessAction": {
+        "type": "CODE",
+        "name": "log_duplicate_booking",
+        "displayName": "Log Duplicate Booking & Skip",
+        "settings": {
+          "sourceCode": {
+            "packageJson": "{}",
+            "code": "export const code = async (inputs) => {\n  console.log(`Duplicate booking detected: ${inputs.eventId}`);\n  return {\n    status: 'skipped',\n    reason: 'duplicate',\n    eventId: inputs.eventId\n  };\n};"
+          },
+          "input": {
+            "eventId": "{{extract_event_details.eventId}}"
+          }
+        }
+      },
+      "onFailureAction": {
+        "type": "PIECE",
+        "name": "mark_booking_processed",
+        "displayName": "Mark Booking as Processed",
+        "settings": {
+          "pieceName": "@activepieces/piece-store",
+          "pieceVersion": "latest",
+          "actionName": "put",
+          "input": {
+            "key": "gcal_event_{{extract_event_details.eventId}}",
+            "value": "{{extract_event_details.timestamp}}"
+          }
+        },
+        "nextAction": {
+          "type": "BRANCH",
+          "name": "has_submission_id",
+          "displayName": "Has Submission ID?",
+          "settings": {
+            "conditions": [
+              [
+                {
+                  "firstValue": "{{extract_event_details.submissionId}}",
+                  "secondValue": null,
+                  "operator": "NOT_EQUAL"
+                }
+              ]
+            ]
+          },
+          "onSuccessAction": {
+            "type": "PIECE",
+            "name": "find_linear_project",
+            "displayName": "Find Linear Project",
+            "settings": {
+              "pieceName": "@activepieces/piece-linear",
+              "pieceVersion": "latest",
+              "actionName": "search_projects",
+              "input": {
+                "query": "{{extract_event_details.submissionId}}",
+                "teamId": "{{env.LINEAR_TEAM_ID}}"
+              }
+            },
+            "nextAction": {
+              "type": "BRANCH",
+              "name": "project_found",
+              "displayName": "Linear Project Found?",
+              "settings": {
+                "conditions": [
+                  [
+                    {
+                      "firstValue": "{{find_linear_project.nodes.length}}",
+                      "secondValue": "0",
+                      "operator": "GREATER_THAN"
+                    }
+                  ]
+                ]
+              },
+              "onSuccessAction": {
+                "type": "PIECE",
+                "name": "add_linear_comment",
+                "displayName": "Add Comment to Linear Project",
+                "settings": {
+                  "pieceName": "@activepieces/piece-linear",
+                  "pieceVersion": "latest",
+                  "actionName": "create_comment",
+                  "input": {
+                    "projectId": "{{find_linear_project.nodes[0].id}}",
+                    "body": "📅 **Strategy Call Scheduled**\\n\\n**Event:** {{extract_event_details.eventTitle}}\\n**Date/Time:** {{extract_event_details.eventStart}}\\n**Client Email:** {{extract_event_details.clientEmail}}\\n**Event Link:** {{extract_event_details.eventLink}}\\n\\n**Pre-Call Checklist:**\\n- [ ] Review Edge Blueprint\\n- [ ] Prepare implementation timeline\\n- [ ] Identify quick wins\\n- [ ] Draft proposal outline"
+                  }
+                }
+              }
+            }
+          },
+          "nextAction": {
+            "type": "PIECE",
+            "name": "send_slack_booking_notification",
+            "displayName": "Send Slack Notification",
+            "settings": {
+              "pieceName": "@activepieces/piece-slack",
+              "pieceVersion": "latest",
+              "actionName": "send_message",
+              "input": {
+                "channel": "{{env.SLACK_SALES_CHANNEL}}",
+                "text": "📅 *New Strategy Call Booked*\\n\\n*Business:* {{extract_event_details.businessName}}\\n*Client Email:* {{extract_event_details.clientEmail}}\\n*Event:* {{extract_event_details.eventTitle}}\\n*Date/Time:* {{extract_event_details.eventStart}}\\n{{#if extract_event_details.submissionId}}*Submission ID:* `{{extract_event_details.submissionId}}`\\n{{/if}}\\n*Calendar Event:* {{extract_event_details.eventLink}}\\n\\n*Pre-Call Actions:*\\n• Review Edge Blueprint (if available)\\n• Prepare implementation proposal\\n• Set up follow-up automation"
+              }
+            },
+            "nextAction": {
+              "type": "BRANCH",
+              "name": "has_client_email",
+              "displayName": "Has Client Email?",
+              "settings": {
+                "conditions": [
+                  [
+                    {
+                      "firstValue": "{{extract_event_details.clientEmail}}",
+                      "secondValue": null,
+                      "operator": "NOT_EQUAL"
+                    }
+                  ]
+                ]
+              },
+              "onSuccessAction": {
+                "type": "PIECE",
+                "name": "send_confirmation_email",
+                "displayName": "Send Booking Confirmation Email",
+                "settings": {
+                  "pieceName": "@activepieces/piece-gmail",
+                  "pieceVersion": "latest",
+                  "actionName": "send_email",
+                  "input": {
+                    "to": "{{extract_event_details.clientEmail}}",
+                    "subject": "Your AI-Edge Strategy Call is Confirmed - {{extract_event_details.businessName}}",
+                    "body_type": "html",
+                    "body": "<html><body style='font-family: Inter, Arial, sans-serif; color: #F5F5F7; background-color: #0B0B0D; padding: 40px;'><div style='max-width: 600px; margin: 0 auto;'><div style='text-align: center; margin-bottom: 40px;'><h1 style='color: #C9A24D; font-size: 28px; margin-bottom: 10px;'>Your Strategy Call is Confirmed</h1><p style='color: #A1A1AA; font-size: 16px;'>{{extract_event_details.businessName}}</p></div><div style='background-color: #141417; border-radius: 8px; padding: 30px; margin-bottom: 30px;'><h2 style='color: #F5F5F7; font-size: 20px; margin-bottom: 20px;'>Meeting Details</h2><p style='color: #A1A1AA; line-height: 1.8; margin-bottom: 10px;'><strong style='color: #F5F5F7;'>Event:</strong> {{extract_event_details.eventTitle}}</p><p style='color: #A1A1AA; line-height: 1.8; margin-bottom: 10px;'><strong style='color: #F5F5F7;'>Date/Time:</strong> {{extract_event_details.eventStart}}</p><p style='color: #A1A1AA; line-height: 1.8;'><a href='{{extract_event_details.eventLink}}' style='color: #C9A24D; text-decoration: none;'>Add to Calendar →</a></p></div><div style='background-color: #141417; border-radius: 8px; padding: 30px; margin-bottom: 30px;'><h2 style='color: #F5F5F7; font-size: 20px; margin-bottom: 15px;'>What to Expect</h2><ul style='color: #A1A1AA; line-height: 1.8;'><li>Review your custom Edge Blueprint</li><li>Discuss implementation timeline</li><li>Identify quick wins for immediate impact</li><li>Outline next steps and deliverables</li></ul></div><div style='background-color: #141417; border-radius: 8px; padding: 30px; margin-bottom: 30px;'><h2 style='color: #F5F5F7; font-size: 20px; margin-bottom: 15px;'>Before the Call</h2><p style='color: #A1A1AA; line-height: 1.6;'>Please review your Edge Blueprint (sent separately) and prepare any questions about implementation, timeline, or specific workflows you'd like to prioritize.</p></div><div style='text-align: center; margin-top: 40px; padding-top: 30px; border-top: 1px solid #141417;'><p style='color: #A1A1AA; font-size: 14px;'>BizBuilders AI<br>Workflow Intelligence for Modern Operators</p></div></div></body></html>"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

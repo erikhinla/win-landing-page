@@ -1,0 +1,200 @@
+{
+  "displayName": "Flow A: Edge Blueprint Intake",
+  "trigger": {
+    "type": "WEBHOOK",
+    "name": "edge_blueprint_webhook",
+    "displayName": "Edge Blueprint Form Submission",
+    "settings": {
+      "inputUiInfo": {
+        "customizedInputs": {}
+      }
+    }
+  },
+  "actions": [
+    {
+      "type": "CODE",
+      "name": "extract_and_validate",
+      "displayName": "Extract & Validate Submission",
+      "settings": {
+        "sourceCode": {
+          "packageJson": "{}",
+          "code": "export const code = async (inputs) => {\n  const payload = inputs.webhook_body;\n  \n  // Extract core fields\n  const submissionId = payload.submissionId;\n  const businessName = payload.businessInfo?.businessName || 'Unknown Business';\n  const email = payload.businessInfo?.email;\n  const industry = payload.businessInfo?.industry || 'Not specified';\n  const blueprint = payload.blueprint || '';\n  \n  // Validate required fields\n  if (!submissionId) {\n    throw new Error('Missing submissionId - cannot process submission');\n  }\n  \n  if (!email) {\n    throw new Error('Missing email - cannot send deliverables');\n  }\n  \n  // Create sanitized folder name\n  const sanitizedBusinessName = businessName\n    .replace(/[^a-zA-Z0-9\\s-]/g, '')\n    .replace(/\\s+/g, '_')\n    .substring(0, 50);\n  \n  const folderPath = `WIN_Leads/${sanitizedBusinessName}/${submissionId}`;\n  \n  return {\n    submissionId,\n    businessName,\n    sanitizedBusinessName,\n    email,\n    industry,\n    blueprint,\n    folderPath,\n    timestamp: new Date().toISOString()\n  };\n};"
+        },
+        "input": {
+          "webhook_body": "{{trigger.body}}"
+        }
+      }
+    },
+    {
+      "type": "PIECE",
+      "name": "check_duplicate",
+      "displayName": "Check for Duplicate Submission",
+      "settings": {
+        "pieceName": "@activepieces/piece-store",
+        "pieceVersion": "latest",
+        "actionName": "get",
+        "input": {
+          "key": "submission_{{extract_and_validate.submissionId}}"
+        }
+      }
+    },
+    {
+      "type": "BRANCH",
+      "name": "duplicate_check",
+      "displayName": "Is Duplicate?",
+      "settings": {
+        "conditions": [
+          [
+            {
+              "firstValue": "{{check_duplicate}}",
+              "secondValue": null,
+              "operator": "NOT_EQUAL"
+            }
+          ]
+        ]
+      },
+      "onSuccessAction": {
+        "type": "CODE",
+        "name": "log_duplicate",
+        "displayName": "Log Duplicate & Skip",
+        "settings": {
+          "sourceCode": {
+            "packageJson": "{}",
+            "code": "export const code = async (inputs) => {\n  console.log(`Duplicate submission detected: ${inputs.submissionId}`);\n  return {\n    status: 'skipped',\n    reason: 'duplicate',\n    submissionId: inputs.submissionId\n  };\n};"
+          },
+          "input": {
+            "submissionId": "{{extract_and_validate.submissionId}}"
+          }
+        }
+      },
+      "onFailureAction": {
+        "type": "PIECE",
+        "name": "mark_processed",
+        "displayName": "Mark as Processed",
+        "settings": {
+          "pieceName": "@activepieces/piece-store",
+          "pieceVersion": "latest",
+          "actionName": "put",
+          "input": {
+            "key": "submission_{{extract_and_validate.submissionId}}",
+            "value": "{{extract_and_validate.timestamp}}"
+          }
+        },
+        "nextAction": {
+          "type": "PIECE",
+          "name": "create_drive_folder",
+          "displayName": "Create Google Drive Folder",
+          "settings": {
+            "pieceName": "@activepieces/piece-google-drive",
+            "pieceVersion": "latest",
+            "actionName": "create_folder",
+            "input": {
+              "folderName": "{{extract_and_validate.sanitizedBusinessName}}_{{extract_and_validate.submissionId}}",
+              "parentFolder": "WIN_Leads"
+            }
+          },
+          "nextAction": {
+            "type": "PIECE",
+            "name": "upload_blueprint",
+            "displayName": "Upload Edge Blueprint to Drive",
+            "settings": {
+              "pieceName": "@activepieces/piece-google-drive",
+              "pieceVersion": "latest",
+              "actionName": "upload_file",
+              "input": {
+                "fileName": "Edge_Blueprint_{{extract_and_validate.submissionId}}.md",
+                "folderId": "{{create_drive_folder.id}}",
+                "fileContent": "{{extract_and_validate.blueprint}}",
+                "mimeType": "text/markdown"
+              }
+            },
+            "nextAction": {
+              "type": "PIECE",
+              "name": "create_linear_project",
+              "displayName": "Create Linear Project",
+              "settings": {
+                "pieceName": "@activepieces/piece-linear",
+                "pieceVersion": "latest",
+                "actionName": "create_project",
+                "input": {
+                  "name": "{{extract_and_validate.businessName}} - Edge Blueprint Implementation",
+                  "description": "Edge Blueprint implementation for {{extract_and_validate.businessName}}\\n\\nIndustry: {{extract_and_validate.industry}}\\nSubmission ID: {{extract_and_validate.submissionId}}\\n\\nDrive Folder: {{create_drive_folder.webViewLink}}",
+                  "teamId": "{{env.LINEAR_TEAM_ID}}"
+                }
+              },
+              "nextAction": {
+                "type": "CODE",
+                "name": "parse_blueprint_tasks",
+                "displayName": "Parse Blueprint for Linear Issues",
+                "settings": {
+                  "sourceCode": {
+                    "packageJson": "{}",
+                    "code": "export const code = async (inputs) => {\n  const blueprint = inputs.blueprint;\n  const tasks = [];\n  \n  // Extract tasks from Implementation Backlog section\n  const backlogMatch = blueprint.match(/## Implementation Backlog[\\s\\S]*?(?=##|$)/);\n  if (backlogMatch) {\n    const backlogSection = backlogMatch[0];\n    const taskMatches = backlogSection.matchAll(/###\\s+(.+?)\\s*\\n([\\s\\S]*?)(?=###|$)/g);\n    \n    for (const match of taskMatches) {\n      const title = match[1].trim();\n      const description = match[2].trim();\n      \n      // Extract priority if present\n      let priority = 2; // Default to Medium\n      if (description.toLowerCase().includes('high priority') || description.toLowerCase().includes('critical')) {\n        priority = 1; // High\n      } else if (description.toLowerCase().includes('low priority')) {\n        priority = 3; // Low\n      }\n      \n      tasks.push({\n        title,\n        description,\n        priority\n      });\n    }\n  }\n  \n  // If no tasks found, create a default task\n  if (tasks.length === 0) {\n    tasks.push({\n      title: 'Review Edge Blueprint',\n      description: 'Review the complete Edge Blueprint and create implementation tasks.',\n      priority: 1\n    });\n  }\n  \n  return { tasks };\n};"
+                  },
+                  "input": {
+                    "blueprint": "{{extract_and_validate.blueprint}}"
+                  }
+                },
+                "nextAction": {
+                  "type": "LOOP",
+                  "name": "create_linear_issues",
+                  "displayName": "Create Linear Issues",
+                  "settings": {
+                    "items": "{{parse_blueprint_tasks.tasks}}"
+                  },
+                  "firstLoopAction": {
+                    "type": "PIECE",
+                    "name": "create_issue",
+                    "displayName": "Create Linear Issue",
+                    "settings": {
+                      "pieceName": "@activepieces/piece-linear",
+                      "pieceVersion": "latest",
+                      "actionName": "create_issue",
+                      "input": {
+                        "title": "{{create_linear_issues.item.title}}",
+                        "description": "{{create_linear_issues.item.description}}",
+                        "projectId": "{{create_linear_project.id}}",
+                        "teamId": "{{env.LINEAR_TEAM_ID}}",
+                        "priority": "{{create_linear_issues.item.priority}}"
+                      }
+                    }
+                  },
+                  "nextAction": {
+                    "type": "PIECE",
+                    "name": "send_slack_notification",
+                    "displayName": "Send Slack Notification to #sales",
+                    "settings": {
+                      "pieceName": "@activepieces/piece-slack",
+                      "pieceVersion": "latest",
+                      "actionName": "send_message",
+                      "input": {
+                        "channel": "{{env.SLACK_SALES_CHANNEL}}",
+                        "text": "🎯 *New Edge Blueprint Submission*\\n\\n*Business:* {{extract_and_validate.businessName}}\\n*Industry:* {{extract_and_validate.industry}}\\n*Email:* {{extract_and_validate.email}}\\n*Submission ID:* `{{extract_and_validate.submissionId}}`\\n\\n*Drive Folder:* {{create_drive_folder.webViewLink}}\\n*Linear Project:* {{create_linear_project.url}}\\n\\n*Next Steps:*\\n• Review Edge Blueprint in Drive\\n• Prioritize implementation tasks in Linear\\n• Schedule follow-up call"
+                      }
+                    },
+                    "nextAction": {
+                      "type": "PIECE",
+                      "name": "send_email",
+                      "displayName": "Send Edge Blueprint Email",
+                      "settings": {
+                        "pieceName": "@activepieces/piece-gmail",
+                        "pieceVersion": "latest",
+                        "actionName": "send_email",
+                        "input": {
+                          "to": "{{extract_and_validate.email}}",
+                          "subject": "Your Custom Edge Blueprint is Ready - {{extract_and_validate.businessName}}",
+                          "body_type": "html",
+                          "body": "<html><body style='font-family: Inter, Arial, sans-serif; color: #F5F5F7; background-color: #0B0B0D; padding: 40px;'><div style='max-width: 600px; margin: 0 auto;'><div style='text-align: center; margin-bottom: 40px;'><h1 style='color: #C9A24D; font-size: 28px; margin-bottom: 10px;'>Your Edge Blueprint is Ready</h1><p style='color: #A1A1AA; font-size: 16px;'>{{extract_and_validate.businessName}}</p></div><div style='background-color: #141417; border-radius: 8px; padding: 30px; margin-bottom: 30px;'><h2 style='color: #F5F5F7; font-size: 20px; margin-bottom: 20px;'>What's Inside Your Blueprint</h2><ul style='color: #A1A1AA; line-height: 1.8;'><li>📊 Workflow Map (current → intelligent state)</li><li>⚡ Automation Plan (3-5 high-impact workflows)</li><li>✅ Implementation Backlog (prioritized tasks)</li><li>🔧 Working Automation (ready to deploy)</li><li>✍️ Brand-Safe Copy Pack (optional)</li></ul></div><div style='background-color: #141417; border-radius: 8px; padding: 30px; margin-bottom: 30px;'><h2 style='color: #F5F5F7; font-size: 20px; margin-bottom: 15px;'>Next Steps</h2><p style='color: #A1A1AA; line-height: 1.6; margin-bottom: 20px;'>Your Edge Blueprint has been generated based on your business context. Our team will review it and reach out within 24 hours to discuss implementation.</p><p style='color: #A1A1AA; line-height: 1.6;'><strong style='color: #F5F5F7;'>Submission ID:</strong> {{extract_and_validate.submissionId}}</p></div><div style='text-align: center; margin-top: 40px;'><a href='{{env.GOOGLE_APPOINTMENT_LINK}}' style='display: inline-block; background-color: #C9A24D; color: #0B0B0D; padding: 15px 40px; border-radius: 6px; text-decoration: none; font-weight: 600; font-size: 16px;'>Book Your Strategy Call</a></div><div style='text-align: center; margin-top: 30px; padding-top: 30px; border-top: 1px solid #141417;'><p style='color: #A1A1AA; font-size: 14px;'>BizBuilders AI<br>Workflow Intelligence for Modern Operators</p></div></div></body></html>"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}
