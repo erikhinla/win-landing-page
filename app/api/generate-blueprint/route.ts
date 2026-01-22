@@ -2,9 +2,12 @@ import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 import { nanoid } from "nanoid";
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+// Initialize OpenAI client lazily at runtime
+function getOpenAIClient() {
+  return new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY,
+  });
+}
 
 export async function POST(request: NextRequest) {
   try {
@@ -66,6 +69,7 @@ Generate the following deliverables in a structured format:
 
 Format the output as structured markdown with clear sections.`;
 
+    const openai = getOpenAIClient();
     const completion = await openai.chat.completions.create({
       model: "gpt-4o",
       messages: [
@@ -127,3 +131,6 @@ Format the output as structured markdown with clear sections.`;
     );
   }
 }
+
+// Mark route as dynamic to prevent static generation
+export const dynamic = "force-dynamic";
